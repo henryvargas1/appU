@@ -29,6 +29,17 @@ const MAPPING = {
   "paperplane.fill": "send",
   "chevron.left.forwardslash.chevron.right": "code",
   "chevron.right": "chevron-right",
+  "chevron.left": "chevron-left",
+  "magnifyingglass": "search",
+  "tray.fill": "inbox",
+  "trash": "delete-outline",
+  "square.and.arrow.up": "ios-share",
+  "checkmark": "check",
+  "clock": "schedule",
+  "archivebox": "archive",
+  "arrow.clockwise": "refresh",
+  "plus": "add",
+  "xmark": "close",
 } satisfies IconMapping;
 
 /**

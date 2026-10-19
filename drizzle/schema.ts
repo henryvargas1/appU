@@ -1,6 +1,7 @@
 import {
   index,
   int,
+  primaryKey,
   mysqlEnum,
   mysqlTable,
   text,
@@ -44,10 +45,49 @@ export const inboxEntries = mysqlTable(
     content: text("content"),
     subjectId: int("subjectId"),
     sourceUrl: text("sourceUrl"),
-    processingStatus: mysqlEnum("processingStatus", ["inbox", "processing", "processed", "needs_review"]).default("inbox").notNull(),
+    attachmentId: int("attachmentId"),
+    /** Clasificación sugerida (JSON) pendiente de revisión por el usuario. */
+    suggestion: text("suggestion"),
+    processingStatus: mysqlEnum("processingStatus", ["inbox", "processing", "processed", "needs_review", "confirmed", "discarded"]).default("inbox").notNull(),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    deletedAt: timestamp("deletedAt"),
   },
   (table) => ({ userIdx: index("inbox_user_idx").on(table.userId) }),
+);
+
+export const attachments = mysqlTable(
+  "attachments",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    userId: int("userId").notNull(),
+    inboxEntryId: int("inboxEntryId"),
+    kind: mysqlEnum("kind", ["photo", "audio", "document"]).notNull(),
+    storageKey: varchar("storageKey", { length: 512 }).notNull(),
+    url: text("url").notNull(),
+    filename: varchar("filename", { length: 240 }),
+    mimeType: varchar("mimeType", { length: 120 }),
+    sizeBytes: int("sizeBytes"),
+    extractedText: text("extractedText"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    deletedAt: timestamp("deletedAt"),
+  },
+  (table) => ({ userIdx: index("attachments_user_idx").on(table.userId) }),
+);
+
+export const transcripts = mysqlTable(
+  "transcripts",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    userId: int("userId").notNull(),
+    attachmentId: int("attachmentId").notNull(),
+    language: varchar("language", { length: 16 }).default("es").notNull(),
+    text: text("text").notNull(),
+    /** Segmentos con tiempos (JSON). */
+    segments: text("segments"),
+    durationSeconds: int("durationSeconds"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => ({ attachmentIdx: index("transcripts_attachment_idx").on(table.attachmentId) }),
 );
 
 export const notes = mysqlTable(
@@ -59,8 +99,10 @@ export const notes = mysqlTable(
     inboxEntryId: int("inboxEntryId"),
     title: varchar("title", { length: 240 }).notNull(),
     content: text("content").notNull(),
+    summary: text("summary"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+    deletedAt: timestamp("deletedAt"),
   },
   (table) => ({ userIdx: index("notes_user_idx").on(table.userId) }),
 );
@@ -74,6 +116,7 @@ export const tasks = mysqlTable(
     sourceEntryId: int("sourceEntryId"),
     title: varchar("title", { length: 240 }).notNull(),
     description: text("description"),
+    kind: mysqlEnum("kind", ["task", "exam", "delivery"]).default("task").notNull(),
     dueAt: timestamp("dueAt"),
     priority: mysqlEnum("priority", ["low", "medium", "high", "critical"]).default("medium").notNull(),
     complexity: int("complexity").default(2).notNull(),
@@ -82,6 +125,7 @@ export const tasks = mysqlTable(
     completedAt: timestamp("completedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+    deletedAt: timestamp("deletedAt"),
   },
   (table) => ({ userIdx: index("tasks_user_idx").on(table.userId), dueIdx: index("tasks_due_idx").on(table.dueAt) }),
 );
@@ -96,6 +140,7 @@ export const taskSteps = mysqlTable(
     position: int("position").default(0).notNull(),
     status: mysqlEnum("status", ["pending", "completed"]).default("pending").notNull(),
     estimatedMinutes: int("estimatedMinutes").default(20).notNull(),
+    completedAt: timestamp("completedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
   (table) => ({ taskIdx: index("task_steps_task_idx").on(table.taskId) }),
@@ -110,7 +155,9 @@ export const studySessions = mysqlTable(
     title: varchar("title", { length: 240 }).notNull(),
     scheduledFor: timestamp("scheduledFor").notNull(),
     durationMinutes: int("durationMinutes").default(30).notNull(),
-    status: mysqlEnum("status", ["planned", "completed", "skipped"]).default("planned").notNull(),
+    status: mysqlEnum("status", ["planned", "completed", "skipped", "rescheduled"]).default("planned").notNull(),
+    /** Sesión original cuando esta es una reprogramación (conserva el historial). */
+    rescheduledFromId: int("rescheduledFromId"),
     completedAt: timestamp("completedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
@@ -126,7 +173,8 @@ export const reminders = mysqlTable(
     title: varchar("title", { length: 240 }).notNull(),
     scheduledFor: timestamp("scheduledFor").notNull(),
     stage: mysqlEnum("stage", ["weekly", "reinforced", "due"]).default("reinforced").notNull(),
-    status: mysqlEnum("status", ["scheduled", "sent", "dismissed", "expired"]).default("scheduled").notNull(),
+    status: mysqlEnum("status", ["scheduled", "sent", "done", "snoozed", "dismissed", "expired"]).default("scheduled").notNull(),
+    actedAt: timestamp("actedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
   (table) => ({ userIdx: index("reminders_user_idx").on(table.userId), scheduleIdx: index("reminders_schedule_idx").on(table.scheduledFor) }),
@@ -167,9 +215,26 @@ export const chatMessages = mysqlTable(
     threadId: int("threadId").notNull(),
     role: mysqlEnum("role", ["user", "assistant"]).notNull(),
     content: text("content").notNull(),
+    /** Acciones estructuradas ejecutadas por el asistente (JSON). */
+    actions: text("actions"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
   (table) => ({ threadIdx: index("chat_messages_thread_idx").on(table.threadId) }),
+);
+
+export const userPreferences = mysqlTable(
+  "userPreferences",
+  {
+    userId: int("userId").notNull(),
+    /** Minutos máximos por día de la semana (domingo = 0), JSON de 7 números; 0 = sin límite. */
+    availability: varchar("availability", { length: 120 }).default("[0,0,0,0,0,0,0]").notNull(),
+    studyStartHour: int("studyStartHour").default(17).notNull(),
+    /** Zona horaria IANA del estudiante: las fechas relativas y el plan diario se calculan en ella. */
+    timeZone: varchar("timeZone", { length: 64 }).default("America/Bogota").notNull(),
+    remindersEnabled: int("remindersEnabled").default(1).notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => ({ pk: primaryKey({ columns: [table.userId] }) }),
 );
 
 export type User = typeof users.$inferSelect;
@@ -177,3 +242,8 @@ export type InsertUser = typeof users.$inferInsert;
 export type Subject = typeof subjects.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Reminder = typeof reminders.$inferSelect;
+export type Note = typeof notes.$inferSelect;
+export type InboxEntry = typeof inboxEntries.$inferSelect;
+export type StudySession = typeof studySessions.$inferSelect;
+export type TaskStep = typeof taskSteps.$inferSelect;
+export type Attachment = typeof attachments.$inferSelect;

@@ -9,9 +9,8 @@ import { createContext } from "./context";
 import { createCorsMiddleware } from "./cors";
 import { clearLegacySessionCookie } from "./cookies";
 import { sdk } from "./sdk";
-import { storageGetSignedUrl, storagePut } from "../storage";
-import { extractAssetText, transcribeAudio } from "../ai";
-import { markDueRemindersExpired } from "../db";
+import { storagePut } from "../storage";
+import { createAttachment, processScheduledReminders } from "../db";
 
 async function startServer() {
   const app = express();
@@ -31,64 +30,47 @@ async function startServer() {
   });
 
   app.post("/api/uploads", async (req, res) => {
+    let user;
     try {
-      const user = await sdk.authenticateRequest(req);
-      if (user.isCron) return res.status(403).json({ error: "Scheduled identity cannot upload" });
-      const { filename, contentType, data } = req.body as { filename?: string; contentType?: string; data?: string };
+      user = await sdk.authenticateRequest(req);
+    } catch {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    if (user.isCron) return res.status(403).json({ error: "Scheduled identity cannot upload" });
+    try {
+      const { filename, contentType, data, kind } = req.body as { filename?: string; contentType?: string; data?: string; kind?: string };
       if (!filename || !data) return res.status(400).json({ error: "filename and data are required" });
+      if (kind !== "photo" && kind !== "audio" && kind !== "document") return res.status(400).json({ error: "kind must be photo, audio or document" });
       const encoded = data.replace(/^data:[^;]+;base64,/, "");
       const bytes = Buffer.from(encoded, "base64");
-      if (bytes.byteLength > 15 * 1024 * 1024) return res.status(413).json({ error: "File is larger than 15 MB" });
-      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const result = await storagePut(`uniflow/${user.id}/${Date.now()}-${safeName}`, bytes, contentType || "application/octet-stream");
-      return res.json(result);
+      if (bytes.byteLength > 15 * 1024 * 1024) return res.status(413).json({ error: "El archivo supera 15 MB" });
+      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
+      const mimeType = contentType || "application/octet-stream";
+      const stored = await storagePut(`uniflow/${user.id}/${Date.now()}-${safeName}`, bytes, mimeType);
+      const attachment = await createAttachment(user.id, { kind, storageKey: stored.key, url: stored.url, filename: safeName, mimeType, sizeBytes: bytes.byteLength });
+      return res.json({ key: stored.key, url: stored.url, attachmentId: attachment.id });
     } catch (error) {
       console.error("[Uploads] Upload failed", error instanceof Error ? error.message : "unknown");
-      return res.status(401).json({ error: "Upload failed" });
+      return res.status(500).json({ error: "Upload failed" });
     }
   });
 
-  app.post("/api/process-asset", async (req, res) => {
-    try {
-      const user = await sdk.authenticateRequest(req);
-      if (user.isCron) return res.status(403).json({ error: "Scheduled identity cannot process assets" });
-      const { key, kind, mimeType } = req.body as { key?: string; kind?: "photo" | "document"; mimeType?: string };
-      if (!key || (kind !== "photo" && kind !== "document")) return res.status(400).json({ error: "key and kind are required" });
-      const url = await storageGetSignedUrl(key);
-      const text = await extractAssetText({ url, kind, mimeType: mimeType || "application/octet-stream" });
-      return res.json({ text });
-    } catch (error) {
-      console.error("[Assets] Processing failed", error instanceof Error ? error.message : "unknown");
-      return res.status(400).json({ error: "Asset processing failed" });
-    }
-  });
-
-  app.post("/api/transcribe", async (req, res) => {
-    try {
-      const user = await sdk.authenticateRequest(req);
-      if (user.isCron) return res.status(403).json({ error: "Scheduled identity cannot transcribe assets" });
-      const { key, filename, mimeType } = req.body as { key?: string; filename?: string; mimeType?: string };
-      if (!key) return res.status(400).json({ error: "key is required" });
-      const signedUrl = await storageGetSignedUrl(key);
-      const response = await fetch(signedUrl);
-      if (!response.ok) return res.status(400).json({ error: "Could not read uploaded audio" });
-      const text = await transcribeAudio({ bytes: await response.arrayBuffer(), filename: filename || "class-audio.m4a", mimeType: mimeType || "audio/mp4" });
-      return res.json({ text });
-    } catch (error) {
-      console.error("[Speech] Transcription failed", error instanceof Error ? error.message : "unknown");
-      return res.status(400).json({ error: "Transcription failed" });
-    }
-  });
-
+  // Endpoint para la tarea programada en la nube (p. ej. cada 15 minutos):
+  // entrega avisos que llegaron a su hora y marca como vencido lo que pasó sin confirmación.
   app.post("/api/scheduled/reminders", async (req, res) => {
+    let user;
     try {
-      const user = await sdk.authenticateRequest(req);
-      if (!user.isCron) return res.status(403).json({ error: "Cron identity required" });
-      const expired = await markDueRemindersExpired();
-      return res.json({ ok: true, expired });
-    } catch (error) {
-      console.error("[Scheduled] Reminder cleanup failed", error instanceof Error ? error.message : "unknown");
+      user = await sdk.authenticateRequest(req);
+    } catch {
       return res.status(401).json({ error: "Scheduled authentication failed" });
+    }
+    if (!user.isCron) return res.status(403).json({ error: "Cron identity required" });
+    try {
+      const result = await processScheduledReminders();
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      console.error("[Scheduled] Reminder processing failed", error instanceof Error ? error.message : "unknown");
+      return res.status(500).json({ error: "Reminder processing failed" });
     }
   });
 

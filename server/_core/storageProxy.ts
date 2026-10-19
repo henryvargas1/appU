@@ -1,5 +1,6 @@
 import type { Express } from "express";
 import { ENV } from "./env";
+import { sdk } from "./sdk";
 
 export function registerStorageProxy(app: Express) {
   app.get("/manus-storage/*", async (req, res) => {
@@ -12,6 +13,16 @@ export function registerStorageProxy(app: Express) {
     if (!ENV.forgeApiUrl || !ENV.forgeApiKey) {
       res.status(500).send("Storage proxy not configured");
       return;
+    }
+
+    // Los archivos de UniFlow se guardan bajo uniflow/<userId>/: solo su dueño puede leerlos.
+    const owner = key.match(/^uniflow\/(\d+)\//)?.[1];
+    if (owner) {
+      const user = await sdk.authenticateRequest(req).catch(() => null);
+      if (!user || user.isCron || String(user.id) !== owner) {
+        res.status(403).send("Forbidden");
+        return;
+      }
     }
 
     try {

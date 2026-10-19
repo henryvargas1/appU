@@ -1,0 +1,1 @@
+ALTER TABLE `userPreferences` ADD `timeZone` varchar(64) DEFAULT 'America/Bogota' NOT NULL;

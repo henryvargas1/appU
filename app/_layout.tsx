@@ -88,6 +88,12 @@ export default function RootLayout() {
           <Stack screenOptions={{ headerShown: false }}>
             <Stack.Screen name="(tabs)" />
             <Stack.Screen name="oauth/callback" />
+            <Stack.Screen name="review/[id]" options={{ presentation: "modal" }} />
+            <Stack.Screen name="task/new" options={{ presentation: "modal" }} />
+            <Stack.Screen name="task/[id]" />
+            <Stack.Screen name="subject/[id]" />
+            <Stack.Screen name="note/[id]" />
+            <Stack.Screen name="settings" />
           </Stack>
           <StatusBar style="auto" />
         </QueryClientProvider>
