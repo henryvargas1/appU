@@ -229,6 +229,8 @@ export const userPreferences = mysqlTable(
     /** Minutos máximos por día de la semana (domingo = 0), JSON de 7 números; 0 = sin límite. */
     availability: varchar("availability", { length: 120 }).default("[0,0,0,0,0,0,0]").notNull(),
     studyStartHour: int("studyStartHour").default(17).notNull(),
+    /** Zona horaria IANA del estudiante: las fechas relativas y el plan diario se calculan en ella. */
+    timeZone: varchar("timeZone", { length: 64 }).default("America/Bogota").notNull(),
     remindersEnabled: int("remindersEnabled").default(1).notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },

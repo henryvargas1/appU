@@ -3,6 +3,9 @@ import * as Auth from "@/lib/_core/auth";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Platform } from "react-native";
 
+// Cada pantalla tiene su propia instancia de useAuth: al cerrar sesión se avisa a todas.
+const logoutListeners = new Set<() => void>();
+
 type UseAuthOptions = {
   autoFetch?: boolean;
 };
@@ -85,7 +88,16 @@ export function useAuth(options?: UseAuthOptions) {
       await Auth.clearUserInfo();
       setUser(null);
       setError(null);
+      logoutListeners.forEach((listener) => listener());
     }
+  }, []);
+
+  useEffect(() => {
+    const listener = () => setUser(null);
+    logoutListeners.add(listener);
+    return () => {
+      logoutListeners.delete(listener);
+    };
   }, []);
 
   const isAuthenticated = useMemo(() => Boolean(user), [user]);

@@ -1,6 +1,8 @@
 // Motor de prioridad, carga diaria, sesiones y recordatorios de UniFlow.
 // Funciones puras: no tocan la base de datos para poder probarlas de forma aislada.
 
+import { DEFAULT_TIME_ZONE, addDaysIn, atTimeIn, startOfDayIn, wallClock } from "../shared/tz";
+
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
@@ -29,16 +31,13 @@ export type PlannedSession = {
 
 const PRIORITY_WEIGHT: Record<Priority, number> = { low: 1, medium: 2, high: 4, critical: 5 };
 
-export function startOfDay(date: Date) {
-  const result = new Date(date);
-  result.setHours(0, 0, 0, 0);
-  return result;
+// Todas las funciones de calendario reciben la zona horaria del estudiante (IANA).
+export function startOfDay(date: Date, tz = DEFAULT_TIME_ZONE) {
+  return startOfDayIn(date, tz);
 }
 
-export function addDays(date: Date, days: number) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
+export function addDays(date: Date, days: number, tz = DEFAULT_TIME_ZONE) {
+  return addDaysIn(date, days, tz);
 }
 
 function roundTo5(value: number) {
@@ -67,9 +66,9 @@ export function urgencyScore(dueAt: Date | null, now: Date) {
 }
 
 /** Días de estudio utilizables antes de la entrega (el día de la entrega cuenta solo si vence de noche). */
-export function studyDaysLeft(dueAt: Date | null, now: Date) {
+export function studyDaysLeft(dueAt: Date | null, now: Date, tz = DEFAULT_TIME_ZONE) {
   if (!dueAt) return 14;
-  const days = Math.round((startOfDay(dueAt).getTime() - startOfDay(now).getTime()) / DAY) + (dueAt.getHours() >= 20 ? 1 : 0);
+  const days = Math.round((startOfDay(dueAt, tz).getTime() - startOfDay(now, tz).getTime()) / DAY) + (wallClock(dueAt, tz).hour >= 20 ? 1 : 0);
   return clamp(days, 1, 14);
 }
 
@@ -100,13 +99,13 @@ export function rankTasks<T extends PlannableTask>(tasks: T[], now: Date) {
  * cantidad de tareas acumuladas, cercanía de fechas y pasos restantes.
  * La disponibilidad del usuario NO interviene aquí: solo recorta después.
  */
-export function dailyStudyMinutes(tasks: PlannableTask[], now: Date) {
+export function dailyStudyMinutes(tasks: PlannableTask[], now: Date, tz = DEFAULT_TIME_ZONE) {
   const active = tasks.filter((task) => remainingMinutes(task) > 0);
   if (!active.length) return 0;
 
   // Ritmo necesario: lo que falta repartido entre los días disponibles.
   const pace = active.reduce((sum, task) => {
-    const days = studyDaysLeft(task.dueAt, now);
+    const days = studyDaysLeft(task.dueAt, now, tz);
     const weight = 1 + (clamp(task.complexity, 1, 5) - 1) * 0.15 + Math.min(5, task.stepsRemaining ?? 0) * 0.05;
     return sum + (remainingMinutes(task) / days) * weight;
   }, 0);
@@ -120,10 +119,10 @@ export function dailyStudyMinutes(tasks: PlannableTask[], now: Date) {
 }
 
 /** Bloque sugerido para una tarea en una sesión. */
-export function suggestedBlockMinutes(task: PlannableTask, now: Date) {
+export function suggestedBlockMinutes(task: PlannableTask, now: Date, tz = DEFAULT_TIME_ZONE) {
   const remaining = remainingMinutes(task);
   if (remaining <= 0) return 0;
-  const perDay = remaining / studyDaysLeft(task.dueAt, now);
+  const perDay = remaining / studyDaysLeft(task.dueAt, now, tz);
   const max = task.complexity >= 4 ? 60 : task.complexity === 3 ? 45 : 30;
   return clamp(roundTo5(Math.max(perDay, 15)), 15, Math.min(max, roundTo5(Math.max(15, remaining))));
 }
@@ -148,24 +147,23 @@ export function escalatePriority(priority: Priority): Priority {
  */
 export function planSessions(
   tasks: PlannableTask[],
-  options: { now: Date; availability?: number[]; horizonDays?: number; startHour?: number },
+  options: { now: Date; availability?: number[]; horizonDays?: number; startHour?: number; timeZone?: string },
 ): PlannedSession[] {
-  const { now, availability = [], horizonDays = 14, startHour = 17 } = options;
+  const { now, availability = [], horizonDays = 14, startHour = 17, timeZone: tz = DEFAULT_TIME_ZONE } = options;
   const pending = tasks.map((task) => ({ ...task, spentMinutes: task.spentMinutes ?? 0 })).filter((task) => remainingMinutes(task) > 0);
   const sessions: PlannedSession[] = [];
-  const today = startOfDay(now);
+  const today = startOfDay(now, tz);
 
   for (let offset = 0; offset < horizonDays; offset++) {
-    const day = addDays(today, offset);
+    const day = addDays(today, offset, tz);
     const dayNow = offset === 0 ? now : day;
     const open = pending.filter((task) => remainingMinutes(task) > 0 && (!task.dueAt || task.dueAt.getTime() > day.getTime()));
     if (!open.length) continue;
 
-    const load = dailyStudyMinutes(open, dayNow);
-    const limit = availability[day.getDay()] ?? 0;
+    const load = dailyStudyMinutes(open, dayNow, tz);
+    const limit = availability[wallClock(day, tz).weekday] ?? 0;
     let budget = limit > 0 ? Math.min(load, limit) : load;
-    let cursor = new Date(day);
-    cursor.setHours(startHour, 0, 0, 0);
+    let cursor = atTimeIn(day, startHour, 0, tz);
     if (offset === 0 && cursor.getTime() < now.getTime()) {
       cursor = new Date(Math.ceil(now.getTime() / (15 * MINUTE)) * 15 * MINUTE);
     }
@@ -173,7 +171,7 @@ export function planSessions(
     for (const task of rankTasks(open, dayNow)) {
       if (budget < 15) break;
       const source = pending.find((item) => item.id === task.id)!;
-      const block = Math.min(suggestedBlockMinutes(source, dayNow), budget);
+      const block = Math.min(suggestedBlockMinutes(source, dayNow, tz), budget);
       if (block < 15) continue;
       // La sesión debe terminar antes de la fecha límite.
       if (source.dueAt && cursor.getTime() + block * MINUTE > source.dueAt.getTime()) continue;
@@ -192,7 +190,7 @@ export type ReminderStage = "weekly" | "reinforced" | "due";
  * Secuencia progresiva: avisos semanales cuando hay tiempo, refuerzos al acercarse
  * y, siempre que se pueda, al menos tres avisos antes de la fecha más el aviso del día.
  */
-export function reminderSchedule(dueAt: Date, now: Date) {
+export function reminderSchedule(dueAt: Date, now: Date, tz = DEFAULT_TIME_ZONE) {
   const due = dueAt.getTime();
   const result: Array<{ date: Date; stage: ReminderStage }> = [];
   const seen = new Set<number>();
@@ -209,8 +207,7 @@ export function reminderSchedule(dueAt: Date, now: Date) {
   add(due - 2 * DAY, "reinforced");
   add(due - DAY, "reinforced");
   // Aviso del día: a primera hora si la entrega es más tarde, o en el momento de la entrega.
-  const morning = new Date(dueAt);
-  morning.setHours(7, 30, 0, 0);
+  const morning = atTimeIn(dueAt, 7, 30, tz);
   add(morning.getTime() < due - HOUR ? morning.getTime() : due, "due");
 
   const beforeDue = () => result.filter((item) => item.stage !== "due").length;
@@ -222,8 +219,8 @@ export function reminderSchedule(dueAt: Date, now: Date) {
 }
 
 /** Inicio (lunes) de la semana que contiene `date`. */
-export function startOfWeek(date: Date) {
-  const day = startOfDay(date);
-  const diff = (day.getDay() + 6) % 7;
-  return addDays(day, -diff);
+export function startOfWeek(date: Date, tz = DEFAULT_TIME_ZONE) {
+  const day = startOfDay(date, tz);
+  const diff = (wallClock(day, tz).weekday + 6) % 7;
+  return addDays(day, -diff, tz);
 }

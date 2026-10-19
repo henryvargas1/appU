@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Text, View } from "react-native";
 import { startOAuthLogin } from "@/constants/oauth";
 import { ScreenContainer } from "@/components/screen-container";
+import { Tap } from "@/components/uni-flow";
 
 export function LoginScreen({ loading = false }: { loading?: boolean }) {
   const [error, setError] = useState<string | null>(null);
@@ -34,9 +35,9 @@ export function LoginScreen({ loading = false }: { loading?: boolean }) {
           {loading ? (
             <View className="mt-5 items-center py-3"><ActivityIndicator color="#486B5A" /></View>
           ) : (
-            <Pressable onPress={handleLogin} className="mt-5 items-center rounded-2xl bg-primary px-5 py-4 active:opacity-80">
+            <Tap onPress={handleLogin} className="mt-5 items-center rounded-2xl bg-primary px-5 py-4 active:opacity-80">
               <Text className="font-semibold text-background">Entrar con Manus</Text>
-            </Pressable>
+            </Tap>
           )}
           {error ? <Text className="mt-3 text-sm text-error">{error}</Text> : null}
           <Text className="mt-4 text-center text-xs leading-4 text-muted">

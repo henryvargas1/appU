@@ -26,6 +26,7 @@ import {
   deleteNote,
   deleteTask,
   exportUserData,
+  getAttachment,
   getAttachmentByKey,
   getChatMessage,
   getInboxEntry,
@@ -67,6 +68,7 @@ import {
 } from "./db";
 import { buildICalendar, buildMarkdownExport } from "./export";
 import { addDays, startOfDay } from "./planner";
+import { isValidTimeZone } from "../shared/tz";
 import { storageGetSignedUrl } from "./storage";
 import { getSessionCookieName, getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -75,6 +77,17 @@ import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 const id = z.number().int().positive();
 const priority = z.enum(["low", "medium", "high", "critical"]);
 const taskKind = z.enum(["task", "exam", "delivery"]);
+const timeZone = z.string().max(64).optional();
+
+/** Usa la zona horaria que envía el dispositivo y la recuerda para el planificador y los avisos. */
+async function resolveTimeZone(userId: number, requested?: string) {
+  const prefs = await getPreferences(userId);
+  if (requested && requested !== prefs.timeZone && isValidTimeZone(requested)) {
+    await updatePreferences(userId, { timeZone: requested });
+    return requested;
+  }
+  return prefs.timeZone;
+}
 
 const taskInput = z.object({
   title: z.string().trim().min(1).max(240),
@@ -117,18 +130,18 @@ function parseActions(raw: string | null): StoredAction[] {
   }
 }
 
-function formatSession(session: { title: string; scheduledFor: Date; durationMinutes: number }) {
-  const day = new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }).format(session.scheduledFor);
+function formatSession(session: { title: string; scheduledFor: Date; durationMinutes: number }, tz: string) {
+  const day = new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "numeric", month: "short", hour: "numeric", minute: "2-digit", timeZone: tz }).format(session.scheduledFor);
   return `• ${day}: ${session.durationMinutes} min — ${session.title}`;
 }
 
-async function planSummary(userId: number) {
+async function planSummary(userId: number, tz: string) {
   const now = new Date();
-  const [snapshot, sessions] = await Promise.all([getPlannerSnapshot(userId), listSessions(userId, now, addDays(startOfDay(now), 4))]);
+  const [snapshot, sessions] = await Promise.all([getPlannerSnapshot(userId), listSessions(userId, now, addDays(startOfDay(now, tz), 4, tz))]);
   const planned = sessions.filter((session) => session.status === "planned").slice(0, 6);
   return [
     `Carga sugerida hoy: ${snapshot.recommendedMinutes} min. ${snapshot.nextAction}`,
-    planned.length ? `Próximas sesiones:\n${planned.map(formatSession).join("\n")}` : "No hay sesiones planificadas.",
+    planned.length ? `Próximas sesiones:\n${planned.map((session) => formatSession(session, tz)).join("\n")}` : "No hay sesiones planificadas.",
   ].join("\n");
 }
 
@@ -172,8 +185,10 @@ export const appRouter = router({
       content: z.string().max(20_000).optional(),
       subjectId: id.nullish(),
       attachmentKey: z.string().max(512).optional(),
+      timeZone,
     })).mutation(({ ctx, input }) => guard(async () => {
       const userId = ctx.user.id;
+      const tz = await resolveTimeZone(userId, input.timeZone);
       let text = input.content?.trim() ?? "";
       let attachment = null;
       let transcript: string | null = null;
@@ -195,7 +210,7 @@ export const appRouter = router({
         }
       }
       const subjects = await listSubjects(userId);
-      const suggestion = await analyzeCapture({ text: [input.title, text].filter(Boolean).join("\n"), kind: input.kind, subjects, now: new Date() });
+      const suggestion = await analyzeCapture({ text: [input.title, text].filter(Boolean).join("\n"), kind: input.kind, subjects, now: new Date(), timeZone: tz });
       if (input.title?.trim()) suggestion.title = input.title.trim();
       if (input.subjectId) {
         const chosen = subjects.find((subject) => subject.id === input.subjectId);
@@ -340,6 +355,11 @@ export const appRouter = router({
       const summary = await summarizeNote(note);
       return updateNote(ctx.user.id, note.id, { summary });
     })),
+    /** Enlace temporal firmado para abrir un archivo propio. */
+    fileUrl: protectedProcedure.input(z.object({ attachmentId: id })).mutation(({ ctx, input }) => guard(async () => {
+      const attachment = await getAttachment(ctx.user.id, input.attachmentId);
+      return { url: await storageGetSignedUrl(attachment.storageKey) };
+    })),
     search: protectedProcedure.input(z.object({ query: z.string().trim().min(2).max(120) }))
       .query(({ ctx, input }) => searchContent(ctx.user.id, input.query, keywords(input.query))),
   }),
@@ -352,9 +372,10 @@ export const appRouter = router({
       const messages = await listChatMessages(ctx.user.id, thread.id);
       return { thread, messages: messages.map((message) => ({ ...message, actions: parseActions(message.actions) })) };
     })),
-    send: protectedProcedure.input(z.object({ threadId: id.optional(), message: z.string().trim().min(1).max(4_000) })).mutation(({ ctx, input }) => guard(async () => {
+    send: protectedProcedure.input(z.object({ threadId: id.optional(), message: z.string().trim().min(1).max(4_000), timeZone })).mutation(({ ctx, input }) => guard(async () => {
       const userId = ctx.user.id;
       const now = new Date();
+      const tz = await resolveTimeZone(userId, input.timeZone);
       const thread = input.threadId ? await getThread(userId, input.threadId) : await getOrCreateThread(userId);
       const history = await listChatMessages(userId, thread.id);
       await addChatMessage(userId, thread.id, "user", input.message);
@@ -365,7 +386,7 @@ export const appRouter = router({
         listSubjects(userId, true),
         searchContent(userId, "", keywords(input.message)),
         listRecentNotes(userId, 8),
-        planSummary(userId),
+        planSummary(userId, tz),
       ]);
       const subjectName = (subjectId: number | null) => subjects.find((subject) => subject.id === subjectId)?.name ?? null;
       const seen = new Set<number>();
@@ -374,6 +395,7 @@ export const appRouter = router({
       const reply = await askAcademicAssistant({
         message: input.message,
         now,
+        timeZone: tz,
         history: history.map((message) => ({ role: message.role, content: message.content })),
         tasks: activeTasks.map((task) => ({ ...task, subjectName: subjectName(task.subjectId) })),
         notes: [
@@ -397,7 +419,7 @@ export const appRouter = router({
           actions.push({ ...action, status: "done" });
         } else if (action.type === "generate_plan") {
           await replanSessions(userId);
-          extra.push(await planSummary(userId));
+          extra.push(await planSummary(userId, tz));
           actions.push({ ...action, status: "done" });
         } else {
           actions.push({ ...action, status: "proposed" });
@@ -446,6 +468,7 @@ export const appRouter = router({
       availability: z.array(z.number().int().min(0).max(600)).length(7).optional(),
       studyStartHour: z.number().int().min(5).max(22).optional(),
       remindersEnabled: z.boolean().optional(),
+      timeZone: z.string().max(64).refine(isValidTimeZone, "Zona horaria no válida").optional(),
     })).mutation(async ({ ctx, input }) => {
       const prefs = await updatePreferences(ctx.user.id, input);
       await replan(ctx.user.id);

@@ -67,7 +67,7 @@ const config: ExpoConfig = {
   scheme: env.scheme,
   userInterfaceStyle: "automatic",
   ios: {
-    supportsTablet: true,
+    supportsTablet: false,
     bundleIdentifier: env.iosBundleId,
     "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
@@ -75,7 +75,7 @@ const config: ExpoConfig = {
   },
   android: {
     adaptiveIcon: {
-      backgroundColor: "#E6F4FE",
+      backgroundColor: "#F7F4EC",
       foregroundImage: "./assets/images/android-icon-foreground.png",
       backgroundImage: "./assets/images/android-icon-background.png",
       monochromeImage: "./assets/images/android-icon-monochrome.png",
@@ -108,7 +108,7 @@ const config: ExpoConfig = {
     [
       "expo-audio",
       {
-        microphonePermission: "Allow $(PRODUCT_NAME) to access your microphone.",
+        microphonePermission: "Permite que UniFlow grabe el audio de tus clases para transcribirlo.",
       },
     ],
     [
@@ -116,6 +116,12 @@ const config: ExpoConfig = {
       {
         photosPermission: "Permite que UniFlow seleccione fotos de tus apuntes.",
         cameraPermission: "Permite que UniFlow tome fotos del tablero.",
+      },
+    ],
+    [
+      "expo-notifications",
+      {
+        color: "#486B5A",
       },
     ],
     [
@@ -131,9 +137,9 @@ const config: ExpoConfig = {
         image: "./assets/images/splash-icon.png",
         imageWidth: 200,
         resizeMode: "contain",
-        backgroundColor: "#ffffff",
+        backgroundColor: "#F7F4EC",
         dark: {
-          backgroundColor: "#000000",
+          backgroundColor: "#17211C",
         },
       },
     ],

@@ -18,6 +18,8 @@ import {
   type Task,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+
+import { atTimeIn, isValidTimeZone } from "../shared/tz";
 import {
   addDays,
   dailyStudyMinutes,
@@ -100,7 +102,7 @@ const ACTIVE_STATUSES = ["pending", "in_progress", "overdue"] as const;
 // Preferencias
 // ---------------------------------------------------------------------------
 
-export type Preferences = { availability: number[]; studyStartHour: number; remindersEnabled: boolean };
+export type Preferences = { availability: number[]; studyStartHour: number; remindersEnabled: boolean; timeZone: string };
 
 function parseAvailability(raw: string) {
   try {
@@ -119,6 +121,7 @@ export async function getPreferences(userId: number): Promise<Preferences> {
     availability: parseAvailability(row?.availability ?? "[]"),
     studyStartHour: row?.studyStartHour ?? 17,
     remindersEnabled: (row?.remindersEnabled ?? 1) === 1,
+    timeZone: row?.timeZone && isValidTimeZone(row.timeZone) ? row.timeZone : "America/Bogota",
   };
 }
 
@@ -131,6 +134,7 @@ export async function updatePreferences(userId: number, input: Partial<Preferenc
     availability: JSON.stringify(next.availability.map((item) => Math.max(0, Math.min(600, Math.round(item))))),
     studyStartHour: Math.max(5, Math.min(22, Math.round(next.studyStartHour))),
     remindersEnabled: next.remindersEnabled ? 1 : 0,
+    timeZone: isValidTimeZone(next.timeZone) ? next.timeZone : current.timeZone,
   };
   await db.insert(userPreferences).values(values).onDuplicateKeyUpdate({ set: values });
   return getPreferences(userId);
@@ -250,7 +254,8 @@ async function scheduleReminders(userId: number, task: Pick<Task, "id" | "title"
   await db.update(reminders).set({ status: "dismissed" })
     .where(and(eq(reminders.userId, userId), eq(reminders.taskId, task.id), inArray(reminders.status, ["scheduled", "sent", "snoozed"])));
   if (!task.dueAt) return;
-  const schedule = reminderSchedule(task.dueAt, new Date());
+  const { timeZone } = await getPreferences(userId);
+  const schedule = reminderSchedule(task.dueAt, new Date(), timeZone);
   if (schedule.length) {
     await db.insert(reminders).values(schedule.map((item) => ({ userId, taskId: task.id, title: task.title, scheduledFor: item.date, stage: item.stage })));
   }
@@ -471,7 +476,7 @@ export async function replanSessions(userId: number) {
     ...task,
     spentMinutes: task.spentMinutes + kept.filter((session) => session.taskId === task.id).reduce((sum, session) => sum + session.durationMinutes, 0),
   }));
-  const plan = planSessions(adjusted, { now, availability: prefs.availability, startHour: prefs.studyStartHour });
+  const plan = planSessions(adjusted, { now, availability: prefs.availability, startHour: prefs.studyStartHour, timeZone: prefs.timeZone });
   if (plan.length) {
     await db.insert(studySessions).values(plan.map((session) => ({ userId, taskId: session.taskId, title: session.title, scheduledFor: session.scheduledFor, durationMinutes: session.durationMinutes })));
   }
@@ -510,10 +515,7 @@ export async function rescheduleSession(userId: number, sessionId: number, to?: 
   const prefs = await getPreferences(userId);
   const now = new Date();
   let when = to;
-  if (!when) {
-    when = addDays(startOfDay(now), 1);
-    when.setHours(prefs.studyStartHour, 0, 0, 0);
-  }
+  if (!when) when = atTimeIn(addDays(startOfDay(now, prefs.timeZone), 1, prefs.timeZone), prefs.studyStartHour, 0, prefs.timeZone);
   const task = session.taskId ? await getOwnedTask(userId, session.taskId).catch(() => null) : null;
   if (task?.dueAt && when.getTime() >= task.dueAt.getTime()) {
     when = new Date(Math.max(now.getTime() + 15 * 60_000, task.dueAt.getTime() - (session.durationMinutes + 30) * 60_000));
@@ -532,7 +534,7 @@ export async function rescheduleSession(userId: number, sessionId: number, to?: 
   if (task) {
     const all = await plannableTasks(userId);
     const item = all.find((candidate) => candidate.id === task.id);
-    const load = dailyStudyMinutes(all, now);
+    const load = dailyStudyMinutes(all, now, prefs.timeZone);
     if (item && isAtRisk(item, now, Math.max(load, 30)) && task.priority !== "critical") {
       await db.update(tasks).set({ priority: escalatePriority(task.priority) }).where(and(eq(tasks.id, task.id), eq(tasks.userId, userId)));
       escalated = true;
@@ -543,12 +545,12 @@ export async function rescheduleSession(userId: number, sessionId: number, to?: 
 
 export async function getPlannerSnapshot(userId: number) {
   const now = new Date();
-  const items = await plannableTasks(userId);
-  const ranked = rankTasks(items, now).map((task) => ({ ...task, atRisk: isAtRisk(task, now), blockMinutes: suggestedBlockMinutes(task, now) }));
-  const recommendedMinutes = dailyStudyMinutes(items, now);
+  const [items, { timeZone }] = await Promise.all([plannableTasks(userId), getPreferences(userId)]);
+  const ranked = rankTasks(items, now).map((task) => ({ ...task, atRisk: isAtRisk(task, now), blockMinutes: suggestedBlockMinutes(task, now, timeZone) }));
+  const recommendedMinutes = dailyStudyMinutes(items, now, timeZone);
   const next = ranked[0];
-  const todayStart = startOfDay(now);
-  const [todaySessions, progress] = await Promise.all([listSessions(userId, todayStart, addDays(todayStart, 1)), getWeeklyProgress(userId)]);
+  const todayStart = startOfDay(now, timeZone);
+  const [todaySessions, progress] = await Promise.all([listSessions(userId, todayStart, addDays(todayStart, 1, timeZone)), getWeeklyProgress(userId)]);
   return {
     tasks: ranked.slice(0, 10),
     totalActive: items.length,
@@ -564,8 +566,9 @@ export async function getPlannerSnapshot(userId: number) {
 
 export async function getWeeklyProgress(userId: number) {
   const db = await database();
-  const from = startOfWeek(new Date());
-  const to = addDays(from, 7);
+  const { timeZone } = await getPreferences(userId);
+  const from = startOfWeek(new Date(), timeZone);
+  const to = addDays(from, 7, timeZone);
   const [weekTasks, weekSessions] = await Promise.all([
     db.select().from(tasks).where(and(eq(tasks.userId, userId), isNull(tasks.deletedAt), or(
       and(gte(tasks.dueAt, from), lt(tasks.dueAt, to)),
@@ -590,16 +593,17 @@ export async function getWeeklyProgress(userId: number) {
 }
 
 export async function getWeekView(userId: number, weekStart: Date) {
-  const from = startOfWeek(weekStart);
-  const to = addDays(from, 7);
+  const { timeZone } = await getPreferences(userId);
+  const from = startOfWeek(weekStart, timeZone);
+  const to = addDays(from, 7, timeZone);
   const db = await database();
   const [weekTasks, weekSessions] = await Promise.all([
     db.select().from(tasks).where(and(eq(tasks.userId, userId), isNull(tasks.deletedAt), gte(tasks.dueAt, from), lt(tasks.dueAt, to))).orderBy(asc(tasks.dueAt)),
     listSessions(userId, from, to),
   ]);
   return Array.from({ length: 7 }, (_, index) => {
-    const day = addDays(from, index);
-    const end = addDays(day, 1);
+    const day = addDays(from, index, timeZone);
+    const end = addDays(day, 1, timeZone);
     const inDay = (date: Date | null) => !!date && date >= day && date < end;
     return {
       date: day,
@@ -678,6 +682,13 @@ export async function createAttachment(userId: number, input: { kind: "photo" | 
 export async function getAttachmentByKey(userId: number, storageKey: string) {
   const db = await database();
   const row = (await db.select().from(attachments).where(and(eq(attachments.storageKey, storageKey), eq(attachments.userId, userId), isNull(attachments.deletedAt))).limit(1))[0];
+  if (!row) throw new NotFoundError("El archivo");
+  return row;
+}
+
+export async function getAttachment(userId: number, attachmentId: number) {
+  const db = await database();
+  const row = (await db.select().from(attachments).where(and(eq(attachments.id, attachmentId), eq(attachments.userId, userId), isNull(attachments.deletedAt))).limit(1))[0];
   if (!row) throw new NotFoundError("El archivo");
   return row;
 }

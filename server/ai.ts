@@ -2,6 +2,7 @@ import { ENV } from "./_core/env";
 import { invokeLLM, type Message } from "./_core/llm";
 import { transcribeAudio as transcribeWithService } from "./_core/voiceTranscription";
 import { normalize, parseSpanishDate, suggestFromText, type CaptureSuggestion, type CaptureType } from "../shared/capture-parser";
+import { parseLocalDateTime, toLocalIso } from "../shared/tz";
 
 export function isAiAvailable() {
   return Boolean(ENV.forgeApiKey);
@@ -39,7 +40,7 @@ const SUGGESTION_SCHEMA = {
     properties: {
       type: { type: "string", enum: ["task", "exam", "delivery", "reminder", "note"] },
       title: { type: "string" },
-      dueAt: { type: ["string", "null"], description: "Fecha ISO 8601 con hora local, o null si no se menciona" },
+      dueAt: { type: ["string", "null"], description: "Fecha y hora local del estudiante en formato AAAA-MM-DDTHH:mm, o null si no se menciona" },
       subjectId: { type: ["integer", "null"] },
       priority: { type: "string", enum: ["low", "medium", "high", "critical"] },
       complexity: { type: "integer", minimum: 1, maximum: 5 },
@@ -60,8 +61,9 @@ export async function analyzeCapture(input: {
   kind: "text" | "photo" | "audio" | "document";
   subjects: Array<{ id: number; name: string }>;
   now: Date;
+  timeZone: string;
 }): Promise<CaptureSuggestion> {
-  const heuristic = suggestFromText(input.text, { now: input.now, subjects: input.subjects });
+  const heuristic = suggestFromText(input.text, { now: input.now, subjects: input.subjects, timeZone: input.timeZone });
   if (!isAiAvailable() || !input.text.trim()) return heuristic;
 
   try {
@@ -77,7 +79,7 @@ export async function analyzeCapture(input: {
         {
           role: "user",
           content: [
-            `Fecha y hora actual: ${input.now.toString()}`,
+            `Fecha y hora local actual: ${toLocalIso(input.now, input.timeZone)} (${new Intl.DateTimeFormat("es-CO", { weekday: "long", timeZone: input.timeZone }).format(input.now)}, zona ${input.timeZone})`,
             `Tipo de captura: ${input.kind}`,
             `Materias: ${input.subjects.map((subject) => `${subject.id}=${subject.name}`).join(", ") || "ninguna"}`,
             `Sugerencia heurística previa: ${JSON.stringify(heuristic)}`,
@@ -90,12 +92,12 @@ export async function analyzeCapture(input: {
     );
     const parsed = parseJson<Omit<CaptureSuggestion, "subjectName" | "dueAt"> & { dueAt: string | null }>(raw);
     if (!parsed) return heuristic;
-    const dueAt = parsed.dueAt ? new Date(parsed.dueAt) : null;
+    const dueAt = parsed.dueAt ? parseLocalDateTime(parsed.dueAt, input.timeZone) : null;
     const subject = input.subjects.find((item) => item.id === parsed.subjectId) ?? null;
     return {
       type: (["task", "exam", "delivery", "reminder", "note"] as CaptureType[]).includes(parsed.type) ? parsed.type : heuristic.type,
       title: parsed.title?.trim().slice(0, 240) || heuristic.title,
-      dueAt: dueAt && !Number.isNaN(dueAt.getTime()) ? dueAt : heuristic.dueAt,
+      dueAt: dueAt ?? heuristic.dueAt,
       subjectId: subject?.id ?? heuristic.subjectId,
       subjectName: subject?.name ?? heuristic.subjectName,
       priority: parsed.priority ?? heuristic.priority,
@@ -265,21 +267,22 @@ const CHAT_SCHEMA = {
 
 type RawAction = { type: string; title: string | null; dueAt: string | null; kind: string | null; priority: string | null; complexity: number | null; subjectId: number | null; taskId: number | null; noteId: number | null };
 
-function sanitizeActions(raw: RawAction[], context: { tasks: ChatContextTask[]; notes: ChatContextNote[]; subjects: Array<{ id: number }> }): ChatAction[] {
+function sanitizeActions(raw: RawAction[], context: { tasks: ChatContextTask[]; notes: ChatContextNote[]; subjects: Array<{ id: number }>; timeZone: string }): ChatAction[] {
   const actions: ChatAction[] = [];
+  const toDate = (value: string | null) => (value ? parseLocalDateTime(value, context.timeZone) : null);
   for (const item of raw.slice(0, 4)) {
     if (item.type === "create_task" && item.title) {
       actions.push({
         type: "create_task",
         title: item.title.slice(0, 240),
-        dueAt: item.dueAt && !Number.isNaN(new Date(item.dueAt).getTime()) ? new Date(item.dueAt).toISOString() : null,
+        dueAt: toDate(item.dueAt)?.toISOString() ?? null,
         kind: item.kind === "exam" || item.kind === "delivery" ? item.kind : "task",
         priority: (["low", "medium", "high", "critical"] as const).find((value) => value === item.priority) ?? "medium",
         complexity: Math.min(5, Math.max(1, item.complexity ?? 2)),
         subjectId: context.subjects.some((subject) => subject.id === item.subjectId) ? item.subjectId : null,
       });
-    } else if (item.type === "change_due_date" && item.taskId && item.dueAt && context.tasks.some((task) => task.id === item.taskId) && !Number.isNaN(new Date(item.dueAt).getTime())) {
-      actions.push({ type: "change_due_date", taskId: item.taskId, dueAt: new Date(item.dueAt).toISOString() });
+    } else if (item.type === "change_due_date" && item.taskId && toDate(item.dueAt) && context.tasks.some((task) => task.id === item.taskId)) {
+      actions.push({ type: "change_due_date", taskId: item.taskId, dueAt: toDate(item.dueAt)!.toISOString() });
     } else if (item.type === "summarize_note" && item.noteId && context.notes.some((note) => note.id === item.noteId)) {
       actions.push({ type: "summarize_note", noteId: item.noteId });
     } else if (item.type === "generate_plan") {
@@ -292,6 +295,7 @@ function sanitizeActions(raw: RawAction[], context: { tasks: ChatContextTask[]; 
 export async function askAcademicAssistant(input: {
   message: string;
   now: Date;
+  timeZone: string;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   tasks: ChatContextTask[];
   notes: ChatContextNote[];
@@ -301,13 +305,13 @@ export async function askAcademicAssistant(input: {
   if (!isAiAvailable()) return fallbackReply(input);
 
   const context = [
-    `Fecha actual: ${input.now.toString()}`,
+    `Fecha y hora local actual: ${toLocalIso(input.now, input.timeZone)} (zona ${input.timeZone}). Las fechas de las acciones van en formato AAAA-MM-DDTHH:mm local.`,
     "Materias:",
     ...input.subjects.map((subject) => `- [${subject.id}] ${subject.name}`),
     "Tareas activas:",
-    ...input.tasks.map((task) => `- [${task.id}] ${task.title} | tipo: ${task.kind} | materia: ${task.subjectName ?? "—"} | fecha: ${task.dueAt?.toISOString() ?? "sin fecha"} | complejidad ${task.complexity}/5 | prioridad ${task.priority} | estado ${task.status}`),
+    ...input.tasks.map((task) => `- [${task.id}] ${task.title} | tipo: ${task.kind} | materia: ${task.subjectName ?? "—"} | fecha: ${task.dueAt ? toLocalIso(task.dueAt, input.timeZone) : "sin fecha"} | complejidad ${task.complexity}/5 | prioridad ${task.priority} | estado ${task.status}`),
     "Notas relevantes:",
-    ...input.notes.map((note) => `- [${note.id}] ${note.title} (${note.subjectName ?? "sin materia"}, ${note.createdAt.toISOString().slice(0, 10)}): ${note.content.slice(0, 900)}`),
+    ...input.notes.map((note) => `- [${note.id}] ${note.title} (${note.subjectName ?? "sin materia"}, ${toLocalIso(note.createdAt, input.timeZone).slice(0, 10)}): ${note.content.slice(0, 900)}`),
     "Plan de estudio calculado:",
     input.planSummary,
   ].join("\n");
@@ -358,39 +362,41 @@ function relevantNotes(message: string, notes: ChatContextNote[]) {
     .map((item) => item.note);
 }
 
-function formatDate(date: Date) {
-  return new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "numeric", month: "long" }).format(date);
+function formatDate(date: Date, timeZone: string) {
+  return new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "numeric", month: "long", timeZone }).format(date);
 }
 
 export function fallbackReply(input: {
   message: string;
   now: Date;
+  timeZone?: string;
   tasks: ChatContextTask[];
   notes: ChatContextNote[];
   subjects: Array<{ id: number; name: string }>;
   planSummary: string;
 }): ChatReply {
   const text = normalize(input.message);
+  const timeZone = input.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   if (/\b(crea|crear|agrega|anade|agendar|agenda|recuerdame|anota)\b/.test(text)) {
     const cleaned = input.message.replace(/^(por favor\s*)?(crea|crear|agrega|añade|anade|agenda|agendar|recuérdame|recuerdame|anota)(\s+(una|un|la|el))?(\s+tarea)?\s*(de|para|que)?\s*:?\s*/i, "");
-    const suggestion = suggestFromText(cleaned || input.message, { now: input.now, subjects: input.subjects });
+    const suggestion = suggestFromText(cleaned || input.message, { now: input.now, subjects: input.subjects, timeZone });
     const kind = suggestion.type === "exam" || suggestion.type === "delivery" ? suggestion.type : "task";
     return {
-      answer: `Preparé esta tarea para que la revises: “${suggestion.title}”${suggestion.dueAt ? `, para el ${formatDate(suggestion.dueAt)}` : ", sin fecha"}. Confírmala si está bien.`,
+      answer: `Preparé esta tarea para que la revises: “${suggestion.title}”${suggestion.dueAt ? `, para el ${formatDate(suggestion.dueAt, timeZone)}` : ", sin fecha"}. Confírmala si está bien.`,
       actions: [{ type: "create_task", title: suggestion.title, dueAt: suggestion.dueAt?.toISOString() ?? null, kind, priority: suggestion.priority, complexity: suggestion.complexity, subjectId: suggestion.subjectId }],
     };
   }
 
   if (/\b(cambia|cambiar|mueve|mover|pasa|aplaza|reprograma)\b/.test(text)) {
-    const dueAt = parseSpanishDate(input.message, input.now);
+    const dueAt = parseSpanishDate(input.message, input.now, timeZone);
     const words = keywords(input.message);
     const task = input.tasks
       .map((item) => ({ item, hits: words.filter((word) => normalize(item.title).includes(word)).length }))
       .sort((a, b) => b.hits - a.hits)[0];
     if (dueAt && task?.hits) {
       return {
-        answer: `Puedo mover “${task.item.title}” al ${formatDate(dueAt)}. Confirma el cambio y recalcularé los recordatorios.`,
+        answer: `Puedo mover “${task.item.title}” al ${formatDate(dueAt, timeZone)}. Confirma el cambio y recalcularé los recordatorios.`,
         actions: [{ type: "change_due_date", taskId: task.item.id, dueAt: dueAt.toISOString() }],
       };
     }
@@ -421,7 +427,7 @@ export function fallbackReply(input: {
   if (/\b(dijo|menciono|explico|profesor|profesora)\b/.test(text)) {
     const notes = relevantNotes(input.message, input.notes).slice(0, 2);
     if (!notes.length) return { answer: "No encontré eso en tus notas guardadas. Si lo grabaste o fotografiaste, captúralo y lo buscaré.", actions: [] };
-    return { answer: notes.map((note) => `En “${note.title}” (${note.createdAt.toLocaleDateString("es-CO")}): ${note.content.slice(0, 300)}`).join("\n\n"), actions: [] };
+    return { answer: notes.map((note) => `En “${note.title}” (${note.createdAt.toLocaleDateString("es-CO", { timeZone })}): ${note.content.slice(0, 300)}`).join("\n\n"), actions: [] };
   }
 
   if (/\b(semana|pendiente|pendientes|que tengo|proximo|proxima|hoy|manana)\b/.test(text)) {
@@ -430,7 +436,7 @@ export function fallbackReply(input: {
     if (!input.tasks.length) return { answer: "No tienes tareas pendientes registradas. Puedes capturar una desde la pestaña Capturar.", actions: [] };
     if (!week.length) return { answer: `No tienes entregas en los próximos 7 días. Tienes ${input.tasks.length} tarea(s) activa(s); la más importante es “${input.tasks[0].title}”.`, actions: [] };
     return {
-      answer: `Esta semana tienes:\n${week.map((task) => `• ${task.title} — ${formatDate(task.dueAt!)}${task.subjectName ? ` (${task.subjectName})` : ""}`).join("\n")}\n\n${input.planSummary}`,
+      answer: `Esta semana tienes:\n${week.map((task) => `• ${task.title} — ${formatDate(task.dueAt!, timeZone)}${task.subjectName ? ` (${task.subjectName})` : ""}`).join("\n")}\n\n${input.planSummary}`,
       actions: [],
     };
   }

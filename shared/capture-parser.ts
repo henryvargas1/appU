@@ -1,6 +1,8 @@
 // Clasificador heurístico de capturas en español. Se usa como respaldo cuando la IA
 // no está disponible y como pista inicial para la revisión del usuario.
 
+import { DEFAULT_TIME_ZONE, wallClock, zonedDate } from "./tz";
+
 export type CaptureType = "task" | "exam" | "delivery" | "reminder" | "note";
 export type CapturePriority = "low" | "medium" | "high" | "critical";
 
@@ -32,12 +34,6 @@ export function normalize(text: string) {
   return text.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
 }
 
-function at(date: Date, hour: number, minute = 0) {
-  const result = new Date(date);
-  result.setHours(hour, minute, 0, 0);
-  return result;
-}
-
 function parseHour(text: string): { hour: number; minute: number } | null {
   const match = text.match(/\ba las (\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.|p\.m\.|de la manana|de la tarde|de la noche)?/);
   if (!match) return null;
@@ -50,66 +46,71 @@ function parseHour(text: string): { hour: number; minute: number } | null {
   return { hour, minute };
 }
 
-/** Extrae una fecha de expresiones como "el viernes", "mañana", "17 de noviembre", "17/11" o "2026-11-17". */
-export function parseSpanishDate(input: string, now: Date): Date | null {
+/**
+ * Extrae una fecha de expresiones como "el viernes", "mañana", "17 de noviembre", "17/11" o "2026-11-17".
+ * Se interpreta en la zona horaria del estudiante (por defecto, la del proceso).
+ */
+export function parseSpanishDate(input: string, now: Date, timeZone = DEFAULT_TIME_ZONE): Date | null {
   const text = normalize(input);
   const time = parseHour(text);
-  const withTime = (date: Date) => (time ? at(date, time.hour, time.minute) : at(date, 9));
-  const today = at(now, 0);
+  const wall = wallClock(now, timeZone);
+  // Fechas de calendario representadas como medianoche UTC: sumar días no sufre cambios de horario.
+  const cal = (year: number, month: number, day: number) => new Date(Date.UTC(year, month, day));
+  const today = cal(wall.year, wall.month, wall.day);
+  const plusDays = (days: number) => new Date(today.getTime() + days * 86_400_000);
+  const withTime = (date: Date) => zonedDate(timeZone, date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), time?.hour ?? 9, time?.minute ?? 0);
 
   const iso = text.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
-  if (iso) return withTime(new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+  if (iso) return withTime(cal(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
 
   const slash = text.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
   if (slash) {
-    const year = slash[3] ? (slash[3].length === 2 ? 2000 + Number(slash[3]) : Number(slash[3])) : now.getFullYear();
-    let date = new Date(year, Number(slash[2]) - 1, Number(slash[1]));
-    if (!slash[3] && date < today) date = new Date(year + 1, Number(slash[2]) - 1, Number(slash[1]));
+    const year = slash[3] ? (slash[3].length === 2 ? 2000 + Number(slash[3]) : Number(slash[3])) : wall.year;
+    let date = cal(year, Number(slash[2]) - 1, Number(slash[1]));
+    if (!slash[3] && date < today) date = cal(year + 1, Number(slash[2]) - 1, Number(slash[1]));
     return withTime(date);
   }
 
   for (const named of text.matchAll(/\b(\d{1,2})\s+(?:de\s+)?([a-z]+)(?:\s+(?:de|del)\s+(\d{4}))?/g)) {
     if (!(named[2] in MONTHS)) continue;
-    const year = named[3] ? Number(named[3]) : now.getFullYear();
-    let date = new Date(year, MONTHS[named[2]], Number(named[1]));
-    if (!named[3] && date < today) date = new Date(year + 1, MONTHS[named[2]], Number(named[1]));
+    const year = named[3] ? Number(named[3]) : wall.year;
+    let date = cal(year, MONTHS[named[2]], Number(named[1]));
+    if (!named[3] && date < today) date = cal(year + 1, MONTHS[named[2]], Number(named[1]));
     return withTime(date);
   }
 
-  if (/\bpasado manana\b/.test(text)) return withTime(new Date(today.getTime() + 2 * 86_400_000));
-  if (/\bmanana\b/.test(text.replace(/\bde la manana\b/g, ""))) return withTime(new Date(today.getTime() + 86_400_000));
+  if (/\bpasado manana\b/.test(text)) return withTime(plusDays(2));
+  if (/\bmanana\b/.test(text.replace(/\bde la manana\b/g, ""))) return withTime(plusDays(1));
   if (/\bhoy\b|\besta (tarde|noche)\b/.test(text)) return withTime(today);
 
   const inDays = text.match(/\ben (\d{1,2}) dias?\b/);
-  if (inDays) return withTime(new Date(today.getTime() + Number(inDays[1]) * 86_400_000));
+  if (inDays) return withTime(plusDays(Number(inDays[1])));
   const inWeeks = text.match(/\ben (\d{1,2}|una|dos|tres) semanas?\b/);
   if (inWeeks) {
     const count = ({ una: 1, dos: 2, tres: 3 } as Record<string, number>)[inWeeks[1]] ?? Number(inWeeks[1]);
-    return withTime(new Date(today.getTime() + count * 7 * 86_400_000));
+    return withTime(plusDays(count * 7));
   }
 
   const weekday = text.match(/\b(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b( de la proxima semana| de la semana que viene)?/);
   if (weekday) {
     const target = WEEKDAYS[weekday[1]];
     if (weekday[2]) {
-      const nextMonday = ((1 - today.getDay() + 7) % 7) || 7;
-      return withTime(new Date(today.getTime() + (nextMonday + ((target + 6) % 7)) * 86_400_000));
+      const nextMonday = ((1 - wall.weekday + 7) % 7) || 7;
+      return withTime(plusDays(nextMonday + ((target + 6) % 7)));
     }
-    const diff = ((target - today.getDay() + 7) % 7) || 7;
-    return withTime(new Date(today.getTime() + diff * 86_400_000));
+    return withTime(plusDays(((target - wall.weekday + 7) % 7) || 7));
   }
 
   if (/\b(la )?(proxima semana|semana que viene)\b/.test(text)) {
-    const diff = ((1 - today.getDay() + 7) % 7) || 7;
-    return withTime(new Date(today.getTime() + diff * 86_400_000));
+    return withTime(plusDays(((1 - wall.weekday + 7) % 7) || 7));
   }
 
   const dayOnly = text.match(/\b(?:el|para el|hasta el)\s+(\d{1,2})\b/);
   if (dayOnly) {
     const day = Number(dayOnly[1]);
     if (day >= 1 && day <= 31) {
-      let date = new Date(now.getFullYear(), now.getMonth(), day);
-      if (date < today) date = new Date(now.getFullYear(), now.getMonth() + 1, day);
+      let date = cal(wall.year, wall.month, day);
+      if (date < today) date = cal(wall.year, wall.month + 1, day);
       return withTime(date);
     }
   }
@@ -160,12 +161,12 @@ function cleanTitle(input: string) {
 
 export function suggestFromText(
   input: string,
-  options: { now: Date; subjects?: Array<{ id: number; name: string }> },
+  options: { now: Date; subjects?: Array<{ id: number; name: string }>; timeZone?: string },
 ): CaptureSuggestion {
-  const { now, subjects = [] } = options;
+  const { now, subjects = [], timeZone = DEFAULT_TIME_ZONE } = options;
   const text = normalize(input);
   const type = detectType(input);
-  const dueAt = parseSpanishDate(input, now);
+  const dueAt = parseSpanishDate(input, now, timeZone);
   const subject = subjects.find((item) => {
     const name = normalize(item.name);
     return text.includes(name) || name.split(/\s+/).some((word) => word.length > 4 && new RegExp(`\\b${word}\\b`).test(text));

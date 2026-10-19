@@ -7,6 +7,12 @@ import { Platform } from "react-native";
 import { useColors } from "@/hooks/use-colors";
 import { useAuth } from "@/hooks/use-auth";
 import { LoginScreen } from "@/components/login-screen";
+import { useReminderNotifications } from "@/lib/notifications";
+
+function ReminderSync() {
+  useReminderNotifications();
+  return null;
+}
 
 export default function TabLayout() {
   const { user, loading } = useAuth();
@@ -20,6 +26,8 @@ export default function TabLayout() {
   }
 
   return (
+    <>
+    <ReminderSync />
     <Tabs
       screenOptions={{
         tabBarActiveTintColor: colors.tint,
@@ -71,5 +79,6 @@ export default function TabLayout() {
         }}
       />
     </Tabs>
+    </>
   );
 }
