@@ -17,6 +17,11 @@ const requireUser = t.middleware(async (opts) => {
     throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
   }
 
+  // Las identidades de tareas programadas no actúan en nombre de un estudiante.
+  if ((ctx.user as { isCron?: boolean }).isCron) {
+    throw new TRPCError({ code: "FORBIDDEN", message: NOT_ADMIN_ERR_MSG });
+  }
+
   return next({
     ctx: {
       ...ctx,
